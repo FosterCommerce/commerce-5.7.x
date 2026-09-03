@@ -512,16 +512,20 @@ class CatalogPricing extends Component
         // Queue purchasable-based and rule-based work into separate rows so they are never cross-contaminated.
         // Catalog pricing rules determine which purchasables are relevant, so the two must be processed independently.
 
+        $queuedNewRow = false;
+
         if (!empty($purchasableIds) || ($purchasableIds === null && empty($catalogPricingRuleIds))) {
             // Specific purchasable IDs: these will be regenerated against all applicable rules
-            $this->_queueCatalogPricingIds($storeId, CatalogPricingQueueRecord::TYPE_PURCHASABLE, $purchasableIds);
+            $queuedNewRow = $this->_queueCatalogPricingIds($storeId, CatalogPricingQueueRecord::TYPE_PURCHASABLE, $purchasableIds);
         }
 
         if (!empty($catalogPricingRuleIds)) {
-            $this->_queueCatalogPricingIds($storeId, CatalogPricingQueueRecord::TYPE_RULE, $catalogPricingRuleIds);
+            $queuedNewRow = $this->_queueCatalogPricingIds($storeId, CatalogPricingQueueRecord::TYPE_RULE, $catalogPricingRuleIds) || $queuedNewRow;
         }
 
-        QueueHelper::push(Craft::createObject(CatalogPricingJob::class), $priority);
+        if ($queuedNewRow) {
+            QueueHelper::push(Craft::createObject(CatalogPricingJob::class), $priority);
+        }
     }
 
     /**
@@ -531,6 +535,17 @@ class CatalogPricing extends Component
     {
         return (new Query())
             ->from(Table::CATALOG_PRICING_QUEUE)
+            ->exists();
+    }
+
+    /**
+     * @return bool
+     */
+    public function hasPendingCatalogPricingQueueRows(): bool
+    {
+        return (new Query())
+            ->from(Table::CATALOG_PRICING_QUEUE)
+            ->where(['reserved' => false])
             ->exists();
     }
 
@@ -611,16 +626,20 @@ class CatalogPricing extends Component
      * @param int|null $storeId
      * @param string $type
      * @param array|null $ids
-     * @return void
+     * @return bool
      * @throws Exception
-     * @throws \RuntimeException if the queue mutex cannot be acquired
      */
-    private function _queueCatalogPricingIds(?int $storeId, string $type, ?array $ids): void
+    private function _queueCatalogPricingIds(?int $storeId, string $type, ?array $ids): bool
     {
         $mutex = Craft::$app->getMutex();
 
         if (!$mutex->acquire('catalogpricingqueue', 5)) {
-            throw new \RuntimeException('Unable to acquire the catalog pricing queue mutex.');
+            // Never fail the save. A second unreserved row for the same store and type costs one
+            // extra job; rows are processed independently and regeneration is idempotent.
+            Craft::warning('Timed out waiting for the catalog pricing queue mutex; queueing an unmerged row.', __METHOD__);
+            $this->_insertCatalogPricingQueueRow($storeId, $type, $ids);
+
+            return true;
         }
 
         try {
@@ -643,18 +662,29 @@ class CatalogPricing extends Component
                 $pendingRecord->setIds($ids);
                 $pendingRecord->save(false);
 
-                return;
+                return false;
             }
 
-            $record = new CatalogPricingQueueRecord();
-            $record->storeId = $storeId;
-            $record->type = $type;
-            $record->setIds($ids);
-            $record->reserved = false;
-            $record->save(false);
+            $this->_insertCatalogPricingQueueRow($storeId, $type, $ids);
+
+            return true;
         } finally {
             $mutex->release('catalogpricingqueue');
         }
+    }
+
+    /**
+     * @param array|null $ids
+     * @throws Exception
+     */
+    private function _insertCatalogPricingQueueRow(?int $storeId, string $type, ?array $ids): void
+    {
+        $record = new CatalogPricingQueueRecord();
+        $record->storeId = $storeId;
+        $record->type = $type;
+        $record->setIds($ids);
+        $record->reserved = false;
+        $record->save(false);
     }
 
     /**

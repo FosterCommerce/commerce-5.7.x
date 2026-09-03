@@ -7,8 +7,10 @@
 
 namespace craft\commerce\queue\jobs;
 
+use Craft;
 use craft\commerce\Plugin;
 use craft\commerce\records\CatalogPricingQueue as CatalogPricingQueueRecord;
+use craft\helpers\Queue as QueueHelper;
 use craft\queue\BaseJob;
 
 class CatalogPricing extends BaseJob
@@ -45,6 +47,10 @@ class CatalogPricing extends BaseJob
             $reservedRecord = $catalogPricingService->reserveCatalogPricingQueueRow();
 
             if (!$reservedRecord) {
+                if ($catalogPricingService->hasPendingCatalogPricingQueueRows()) {
+                    QueueHelper::push(Craft::createObject(self::class), 100, 5);
+                }
+
                 return;
             }
 
