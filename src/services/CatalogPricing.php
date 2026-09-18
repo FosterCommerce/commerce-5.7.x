@@ -507,7 +507,12 @@ class CatalogPricing extends Component
         }
 
         $storeId = $config['storeId'] ?? null;
-        $this->markPricesAsUpdatePending($catalogPricingRuleIds, $purchasableIds, $storeId);
+
+        // Only mark outside a transaction, since a purchasable save deadlocks against the base price insert
+        // The queued job regenerates these prices either way
+        if (Craft::$app->getDb()->getTransaction() === null) {
+            $this->markPricesAsUpdatePending($catalogPricingRuleIds, $purchasableIds, $storeId);
+        }
 
         // Queue purchasable-based and rule-based work into separate rows so they are never cross-contaminated.
         // Catalog pricing rules determine which purchasables are relevant, so the two must be processed independently.
