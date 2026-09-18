@@ -228,25 +228,40 @@ class CatalogPricing extends Component
                     Console::stdout(PHP_EOL . sprintf('Generating base prices rows for purchasables %s to %s of %s... ', $fromCount, $toCount, $total));
                 }
 
-                $uuidFunction = Craft::$app->getDb()->getIsPgsql() ? 'gen_random_uuid()' : 'UUID()';
+                // Read the base prices first, since MySQL locks every row an INSERT ... SELECT reads until the transaction ends
+                $baseStorePrices = (new Query())
+                    ->select(['purchasableId', 'storeId', 'basePrice', 'basePromotionalPrice'])
+                    ->from(Table::PURCHASABLES_STORES)
+                    ->where(['purchasableId' => $purchasableIdsChunk])
+                    ->all();
 
-                $schema = Craft::$app->getDb()->getSchema();
-                $catalogPricingTable = $schema->getRawTableName(Table::CATALOG_PRICING);
-                $commercePurchasablesStoresTable = $schema->getRawTableName(Table::PURCHASABLES_STORES);
+                $basePriceRows = [];
+                $basePromotionalPriceRows = [];
 
-                $insert = Craft::$app->getDb()->createCommand()->setSql('
-    INSERT INTO [[' . $catalogPricingTable . ']] ([[price]], [[purchasableId]], [[storeId]], [[uid]], [[dateCreated]], [[dateUpdated]])
-    SELECT [[basePrice]], [[purchasableId]], [[storeId]], ' . $uuidFunction . ', NOW(), NOW() FROM [[' . $commercePurchasablesStoresTable . ']]
-    WHERE [[purchasableId]] IN (' . implode(',', $purchasableIdsChunk) . ')
-                ');
-                $insert->execute();
+                foreach ($baseStorePrices as $baseStorePrice) {
+                    $basePriceRows[] = [
+                        $baseStorePrice['purchasableId'],
+                        $baseStorePrice['basePrice'],
+                        $baseStorePrice['storeId'],
+                    ];
 
-                $insert = Craft::$app->getDb()->createCommand()->setSql('
-    INSERT INTO [[' . $catalogPricingTable . ']] ([[price]], [[purchasableId]], [[storeId]], [[isPromotionalPrice]], [[uid]], [[dateCreated]], [[dateUpdated]])
-    SELECT [[basePromotionalPrice]], [[purchasableId]], [[storeId]], true, ' . $uuidFunction . ', NOW(), NOW() FROM [[' . $commercePurchasablesStoresTable . ']]
-    WHERE (NOT ([[basePromotionalPrice]] is null)) AND [[purchasableId]] IN (' . implode(',', $purchasableIdsChunk) . ')
-                ');
-                $insert->execute();
+                    if ($baseStorePrice['basePromotionalPrice'] !== null) {
+                        $basePromotionalPriceRows[] = [
+                            $baseStorePrice['purchasableId'],
+                            $baseStorePrice['basePromotionalPrice'],
+                            $baseStorePrice['storeId'],
+                            true,
+                        ];
+                    }
+                }
+
+                Craft::$app->getDb()->createCommand()
+                    ->batchInsert(Table::CATALOG_PRICING, ['purchasableId', 'price', 'storeId'], $basePriceRows)
+                    ->execute();
+
+                Craft::$app->getDb()->createCommand()
+                    ->batchInsert(Table::CATALOG_PRICING, ['purchasableId', 'price', 'storeId', 'isPromotionalPrice'], $basePromotionalPriceRows)
+                    ->execute();
 
                 if ($showConsoleOutput) {
                     Console::stdout('done!');
@@ -507,7 +522,12 @@ class CatalogPricing extends Component
         }
 
         $storeId = $config['storeId'] ?? null;
-        $this->markPricesAsUpdatePending($catalogPricingRuleIds, $purchasableIds, $storeId);
+
+        // Only mark outside a transaction, since a purchasable save deadlocks against the base price insert
+        // The queued job regenerates these prices either way
+        if (Craft::$app->getDb()->getTransaction() === null) {
+            $this->markPricesAsUpdatePending($catalogPricingRuleIds, $purchasableIds, $storeId);
+        }
 
         // Queue purchasable-based and rule-based work into separate rows so they are never cross-contaminated.
         // Catalog pricing rules determine which purchasables are relevant, so the two must be processed independently.
